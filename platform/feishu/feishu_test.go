@@ -300,11 +300,20 @@ func TestExtractPostPlainText_Empty(t *testing.T) {
 	}
 }
 
-func TestExtractPostPlainText_NonTextTagsIgnored(t *testing.T) {
+func TestExtractPostPlainText_LinkTextExtracted(t *testing.T) {
 	content := `{"content":[[{"tag":"text","text":"hello"},{"tag":"a","text":"link","href":"http://x.com"}]]}`
 	got := extractPostPlainText(content)
-	if got != "hello" {
-		t.Errorf("expected 'hello', got %q", got)
+	if got != "hellolink" {
+		t.Errorf("expected 'hellolink', got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_CodeBlockAndHr(t *testing.T) {
+	content := `{"content":[[{"tag":"code_block","text":"fmt.Println()","language":"go"}],[{"tag":"hr"}]]}`
+	got := extractPostPlainText(content)
+	expected := "```go\nfmt.Println()```\n---"
+	if got != expected {
+		t.Errorf("expected %q, got %q", expected, got)
 	}
 }
 

@@ -1005,8 +1005,9 @@ func (p *Platform) fetchQuotedMessage(parentID string) string {
 func extractPostPlainText(content string) string {
 	var post struct {
 		Content [][]struct {
-			Tag  string `json:"tag"`
-			Text string `json:"text"`
+			Tag      string `json:"tag"`
+			Text     string `json:"text"`
+			Language string `json:"language"`
 		} `json:"content"`
 		Title string `json:"title"`
 	}
@@ -1032,8 +1033,21 @@ func extractPostPlainText(content string) string {
 	for _, para := range post.Content {
 		var line []string
 		for _, elem := range para {
-			if elem.Tag == "text" && elem.Text != "" {
-				line = append(line, elem.Text)
+			switch elem.Tag {
+			case "text", "a":
+				if elem.Text != "" {
+					line = append(line, elem.Text)
+				}
+			case "code_block":
+				if elem.Text != "" {
+					if elem.Language != "" {
+						line = append(line, fmt.Sprintf("```%s\n%s```", elem.Language, elem.Text))
+					} else {
+						line = append(line, fmt.Sprintf("```\n%s```", elem.Text))
+					}
+				}
+			case "hr":
+				line = append(line, "---")
 			}
 		}
 		if len(line) > 0 {
