@@ -940,29 +940,38 @@ func (p *Platform) resolveChatName(chatID string) string {
 // Returns empty string on any failure (graceful degradation — the user's own
 // message is still delivered without the quote).
 func (p *Platform) fetchQuotedMessage(parentID string) string {
-	resp, err := p.client.Im.Message.Get(context.Background(),
-		larkim.NewGetMessageReqBuilder().
-			MessageId(parentID).
-			Build())
+	// Use raw API call with card_msg_content_type=raw_card_content so that
+	// interactive card messages return the full card JSON (with json_card field)
+	// instead of the simplified final state.
+	apiPath := fmt.Sprintf("/open-apis/im/v1/messages/%s?card_msg_content_type=raw_card_content", parentID)
+	apiResp, err := p.client.Get(context.Background(), apiPath, nil, larkcore.AccessTokenTypeTenant)
 	if err != nil {
 		slog.Debug(p.tag()+": fetch quoted message failed", "parent_id", parentID, "error", err)
 		return ""
 	}
-	if !resp.Success() || resp.Data == nil || len(resp.Data.Items) == 0 {
-		slog.Debug(p.tag()+": fetch quoted message: no data", "parent_id", parentID)
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Items []struct {
+				MsgType string `json:"msg_type"`
+				Sender  struct {
+					ID string `json:"id"`
+				} `json:"sender"`
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []*larkim.Mention `json:"mentions"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(apiResp.RawBody, &resp); err != nil || resp.Code != 0 || len(resp.Data.Items) == 0 {
+		slog.Debug(p.tag()+": fetch quoted message: parse failed or no data", "parent_id", parentID)
 		return ""
 	}
 
 	item := resp.Data.Items[0]
-	msgType := ""
-	if item.MsgType != nil {
-		msgType = *item.MsgType
-	}
-
-	content := ""
-	if item.Body != nil && item.Body.Content != nil {
-		content = *item.Body.Content
-	}
+	msgType := item.MsgType
+	content := item.Body.Content
 	if content == "" {
 		return ""
 	}
@@ -980,6 +989,8 @@ func (p *Platform) fetchQuotedMessage(parentID string) string {
 	case "post":
 		// Rich text — extract text elements from the post structure.
 		quotedText = extractPostPlainText(content)
+	case "interactive":
+		quotedText = extractInteractiveCardText(content)
 	default:
 		// For non-text types (image, file, audio, etc.), use a type indicator.
 		quotedText = fmt.Sprintf("[%s]", msgType)
@@ -991,8 +1002,8 @@ func (p *Platform) fetchQuotedMessage(parentID string) string {
 
 	// Resolve sender name.
 	senderName := ""
-	if item.Sender != nil && item.Sender.Id != nil {
-		senderName = p.resolveUserName(*item.Sender.Id)
+	if item.Sender.ID != "" {
+		senderName = p.resolveUserName(item.Sender.ID)
 	}
 	if senderName == "" {
 		senderName = "unknown"
@@ -1041,6 +1052,157 @@ func extractPostPlainText(content string) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// extractInteractiveCardText extracts readable text from a Feishu interactive card JSON.
+// With raw_card_content, the response wraps the card in {"json_card": "...", ...}.
+// Supports schema 2.0 (body.property.elements with recursive nesting) and
+// legacy format (top-level title + elements).
+func extractInteractiveCardText(content string) string {
+	// Try raw_card_content format: {"json_card": "<escaped JSON>", ...}
+	var wrapper struct {
+		JsonCard string `json:"json_card"`
+	}
+	cardJSON := content
+	if json.Unmarshal([]byte(content), &wrapper) == nil && wrapper.JsonCard != "" {
+		cardJSON = wrapper.JsonCard
+	}
+
+	var card map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		return "[interactive card]"
+	}
+
+	var parts []string
+
+	// Schema 2.0: body.property.elements[] with recursive structure.
+	if raw, ok := card["body"]; ok {
+		var body struct {
+			Tag      string `json:"tag"`
+			Property struct {
+				Elements []json.RawMessage `json:"elements"`
+			} `json:"property"`
+		}
+		if json.Unmarshal(raw, &body) == nil && body.Tag == "body" {
+			extractCardElements(body.Property.Elements, &parts)
+		}
+	}
+
+	// Legacy: direct title string + flat/nested elements.
+	if len(parts) == 0 {
+		if raw, ok := card["header"]; ok {
+			var header struct {
+				Title struct{ Content string `json:"content"` } `json:"title"`
+			}
+			if json.Unmarshal(raw, &header) == nil && header.Title.Content != "" {
+				parts = append(parts, header.Title.Content)
+			}
+		}
+		if len(parts) == 0 {
+			if raw, ok := card["title"]; ok {
+				var title string
+				if json.Unmarshal(raw, &title) == nil && title != "" {
+					parts = append(parts, title)
+				}
+			}
+		}
+		var elements []json.RawMessage
+		if raw, ok := card["elements"]; ok {
+			var nested [][]json.RawMessage
+			if json.Unmarshal(raw, &nested) == nil && len(nested) > 0 {
+				for _, row := range nested {
+					elements = append(elements, row...)
+				}
+			} else {
+				_ = json.Unmarshal(raw, &elements)
+			}
+		}
+		for _, raw := range elements {
+			var elem struct {
+				Tag  string `json:"tag"`
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(raw, &elem) == nil && elem.Tag == "text" && strings.TrimSpace(elem.Text) != "" {
+				parts = append(parts, elem.Text)
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		return "[interactive card]"
+	}
+	return strings.Join(parts, "\n")
+}
+
+// extractCardElements recursively extracts text from schema 2.0 card elements.
+// Handles: property.content, property.text (nested element), property.elements (recursive),
+// code_span, code_block (with tokenized contents), text_tag, hr, etc.
+func extractCardElements(elements []json.RawMessage, parts *[]string) {
+	for _, raw := range elements {
+		var elem struct {
+			Tag      string `json:"tag"`
+			Property struct {
+				Content  string            `json:"content"`
+				Contents json.RawMessage   `json:"contents"`
+				Language string            `json:"language"`
+				Elements []json.RawMessage `json:"elements"`
+				Text     json.RawMessage   `json:"text"`
+			} `json:"property"`
+		}
+		if json.Unmarshal(raw, &elem) != nil {
+			continue
+		}
+		switch elem.Tag {
+		case "code_block":
+			var lines []struct {
+				Contents []struct {
+					Content string `json:"content"`
+				} `json:"contents"`
+			}
+			if json.Unmarshal(elem.Property.Contents, &lines) == nil {
+				var codeLines []string
+				for _, line := range lines {
+					var lineText string
+					for _, tok := range line.Contents {
+						lineText += tok.Content
+					}
+					codeLines = append(codeLines, lineText)
+				}
+				code := strings.Join(codeLines, "")
+				if strings.TrimSpace(code) != "" {
+					lang := elem.Property.Language
+					if lang != "" {
+						*parts = append(*parts, fmt.Sprintf("```%s\n%s```", lang, code))
+					} else {
+						*parts = append(*parts, fmt.Sprintf("```\n%s```", code))
+					}
+				}
+			}
+		case "code_span":
+			if elem.Property.Content != "" {
+				*parts = append(*parts, "`"+elem.Property.Content+"`")
+			}
+		case "hr":
+			*parts = append(*parts, "---")
+		default:
+			if elem.Property.Content != "" {
+				*parts = append(*parts, elem.Property.Content)
+			}
+			if len(elem.Property.Text) > 0 {
+				var textElem struct {
+					Property struct {
+						Content string `json:"content"`
+					} `json:"property"`
+				}
+				if json.Unmarshal(elem.Property.Text, &textElem) == nil && textElem.Property.Content != "" {
+					*parts = append(*parts, textElem.Property.Content)
+				}
+			}
+		}
+		if len(elem.Property.Elements) > 0 {
+			extractCardElements(elem.Property.Elements, parts)
+		}
+	}
 }
 
 // parseMergeForward fetches sub-messages of a merge_forward message via the
