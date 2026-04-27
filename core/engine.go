@@ -4004,12 +4004,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// can render it with smaller/dim styling. CCD path takes priority
 			// when claudecode metadata is available; other paths fall back to
 			// the inline reply footer (with contextText routed into footerContext
-			// per 34af331a's contextIndicator-into-footer rule).
+			// per 34af331a's contextIndicator-into-footer rule). In rich mode,
+			// the inline-append fallback is suppressed — the rich card renders
+			// an equivalent statusFooter through BuildRichCard, so re-appending
+			// the legacy footer here would double-print into the card body.
 			var statusFooter string
 			if !isSilent {
 				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir); status != "" {
 					statusFooter = status
-				} else {
+				} else if !hasRichCard {
 					footerContext := replyFooterContextText(replyFooterSessionContextUsage(state.agentSession), e.i18n)
 					if contextText != "" && e.replyFooterEnabled {
 						footerContext = contextText
@@ -4118,11 +4121,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			} else if suppressDuplicate {
 				sp.discard()
-				if metaOnly := strings.TrimSpace(strings.TrimPrefix(fullResponse, baseResponse)); metaOnly != "" {
-					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
-						return
-					}
-				}
 				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
 			} else if sp.finish(fullResponse, statusFooter) {
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
