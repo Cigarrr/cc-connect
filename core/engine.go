@@ -5390,20 +5390,28 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 
 	// Line 2: model + effort + ctx (status only — no workdir tail)
 	if e.showContextIndicator {
-		var statusParts []string
-		if model := replyFooterModel(session, agent); model != "" {
-			statusParts = append(statusParts, model)
-		}
-		if effort := replyFooterReasoningEffort(session, agent); effort != "" {
-			statusParts = append(statusParts, effort)
-		}
-		if ctxText := replyFooterContextText(replyFooterSessionContextUsage(session), e.i18n); ctxText != "" {
-			statusParts = append(statusParts, ctxText)
-		} else if usage := e.replyFooterUsageText(session, agent); usage != "" {
-			statusParts = append(statusParts, usage)
-		}
-		if len(statusParts) > 0 {
-			lines = append(lines, strings.Join(statusParts, " · "))
+		// Capable agents (claudecode and any other implementing
+		// CCDStatusFooterCapable) get the CCD-statusline-style line:
+		//   <model> · [effort:X ·] out N · in N [cw N cr N] · ctx N%
+		// Other agents fall back to the legacy `model · effort · 剩余 X%` shape.
+		if line := e.ccdStatusMetricsLine(agent, session); line != "" {
+			lines = append(lines, line)
+		} else {
+			var statusParts []string
+			if model := replyFooterModel(session, agent); model != "" {
+				statusParts = append(statusParts, model)
+			}
+			if effort := replyFooterReasoningEffort(session, agent); effort != "" {
+				statusParts = append(statusParts, effort)
+			}
+			if ctxText := replyFooterContextText(replyFooterSessionContextUsage(session), e.i18n); ctxText != "" {
+				statusParts = append(statusParts, ctxText)
+			} else if usage := e.replyFooterUsageText(session, agent); usage != "" {
+				statusParts = append(statusParts, usage)
+			}
+			if len(statusParts) > 0 {
+				lines = append(lines, strings.Join(statusParts, " · "))
+			}
 		}
 	}
 
@@ -5681,6 +5689,74 @@ func compactReplyFooterPath(path string) string {
 // Returns "" if reply_footer is disabled, or if the active session does not
 // expose per-turn cache-token data (i.e. this is not claudecode or no result
 // event has arrived yet) so callers fall back to the default footer.
+// ccdStatusMetricsLine renders the CCD-statusline-style metrics line:
+//
+//	<model id> · [effort:X ·] out N · in N [cw N cr N] · ctx N%
+//
+// Returns "" when the agent does not opt in via CCDStatusFooterCapable, when
+// usage is unavailable, or when reply_footer / show_context_indicator are off.
+// Shared between the rich-card path (composeRichStatusFooter) and the
+// non-rich-card path (buildClaudeStatusLineFooter).
+//
+// `·` separates major segments; tokens-in tier (in/cw/cr) groups under one
+// segment because cw/cr are just cache-tiered variants of input. cw/cr are
+// appended only when at least one is > 0 (turns without cache hits — e.g.
+// very first sub-call after a fresh API context — would otherwise render
+// "cw 0 cr 0", which is noise). Raw model id is preserved (e.g.
+// "claude-opus-4-7[1m]") for diagnostic clarity over a prettified display name.
+func (e *Engine) ccdStatusMetricsLine(agent Agent, session AgentSession) string {
+	if !e.replyFooterEnabled || !e.showContextIndicator {
+		return ""
+	}
+	cf, ok := agent.(CCDStatusFooterCapable)
+	if !ok || !cf.UsesCCDStatusFooter() {
+		return ""
+	}
+	usage := replyFooterSessionContextUsage(session)
+	if usage == nil || usage.ContextWindow <= 0 {
+		return ""
+	}
+
+	used := usage.UsedTokens
+	if used <= 0 {
+		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
+	}
+	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+
+	var parts []string
+	if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
+		parts = append(parts, model)
+	}
+	if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
+		parts = append(parts, "effort:"+effort)
+	}
+	parts = append(parts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
+	if usage.CacheCreationInputTokens > 0 || usage.CachedInputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("in %s cw %s cr %s",
+			formatStatusTokenCount(usage.InputTokens),
+			formatStatusTokenCount(usage.CacheCreationInputTokens),
+			formatStatusTokenCount(usage.CachedInputTokens)))
+	} else {
+		parts = append(parts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
+	}
+	remaining := 100 - pct
+	if remaining < 0 {
+		remaining = 0
+	}
+	// "ctx ~N% left": tilde signals the percentage is heuristic (used-token
+	// estimate over the model context window); "left" matches the codex CLI
+	// statusline convention so users carrying intuition between agents read
+	// the same direction (remaining capacity, not consumed).
+	parts = append(parts, fmt.Sprintf("ctx ~%d%% left", remaining))
+	return strings.Join(parts, " · ")
+}
+
 func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string) string {
 	if !e.replyFooterEnabled {
 		return ""
@@ -5689,48 +5765,14 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	if usage == nil || usage.ContextWindow <= 0 {
 		return ""
 	}
-	// Only emit the CCD-style footer when we have the cache-token signals
-	// that CCD's statusline consumes. Other agents (codex, gemini) fall
-	// through to the default footer.
-	if usage.CachedInputTokens == 0 && usage.CacheCreationInputTokens == 0 {
+	// CCD-style multi-line footer is opt-in via the CCDStatusFooterCapable
+	// capability interface (CLAUDE.md §1: no agent registry names in core).
+	// Other agents (codex, gemini, kimi, etc.) fall through to the default footer.
+	if cf, ok := agent.(CCDStatusFooterCapable); !ok || !cf.UsesCCDStatusFooter() {
 		return ""
 	}
 
-	var line1 string
-	if e.showContextIndicator {
-		used := usage.UsedTokens
-		if used <= 0 {
-			used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
-		}
-		pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
-		if pct < 0 {
-			pct = 0
-		}
-		if pct > 100 {
-			pct = 100
-		}
-
-		// Compose:
-		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
-		// `·` separates major segments; tokens-in tier (in/cw/cr) groups under
-		// one segment because cw/cr are just cache-tiered variants of input.
-		// Raw model id is preserved (e.g. "claude-opus-4-7[1m]") for diagnostic
-		// clarity over a prettified display name.
-		var line1Parts []string
-		if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
-			line1Parts = append(line1Parts, model)
-		}
-		if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
-			line1Parts = append(line1Parts, "effort:"+effort)
-		}
-		line1Parts = append(line1Parts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s",
-			formatStatusTokenCount(usage.InputTokens),
-			formatStatusTokenCount(usage.CacheCreationInputTokens),
-			formatStatusTokenCount(usage.CachedInputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("ctx %d%%", pct))
-		line1 = strings.Join(line1Parts, " · ")
-	}
+	line1 := e.ccdStatusMetricsLine(agent, session)
 
 	var line2 string
 	if e.showWorkdirIndicator {

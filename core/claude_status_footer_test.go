@@ -7,6 +7,14 @@ import (
 	"testing"
 )
 
+// stubClaudecodeAgent is a minimal Agent that implements
+// CCDStatusFooterCapable so buildClaudeStatusLineFooter's capability gate
+// triggers under test.
+type stubClaudecodeAgent struct{ stubAgent }
+
+func (a *stubClaudecodeAgent) Name() string              { return "claudecode" }
+func (a *stubClaudecodeAgent) UsesCCDStatusFooter() bool { return true }
+
 // newClaudeFooterEngine returns an Engine with all three footer-related flags
 // turned on, suitable for invoking buildClaudeStatusLineFooter as a method.
 func newClaudeFooterEngine() *Engine {
@@ -40,14 +48,39 @@ func TestBuildClaudeStatusLineFooter_NilUsage(t *testing.T) {
 		workDir: "/tmp/ws",
 	}
 	e := newClaudeFooterEngine()
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws"); got != "" {
 		t.Errorf("expected empty footer for nil usage, got %q", got)
 	}
 }
 
-func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
-	// Other agents (codex/gemini) populate ContextUsage without cache
-	// tokens; we must NOT emit the claude-style footer for them.
+func TestBuildClaudeStatusLineFooter_NonClaudecodeAgent(t *testing.T) {
+	// Other agents (codex/gemini/etc.) must NOT trigger the claude-style
+	// footer regardless of whether their session populates ContextUsage:
+	// the gate is on the agent name, not on the cache-token shape.
+	session := &controllableAgentSession{
+		model:   "gpt-5.4",
+		workDir: "/tmp/ws",
+		contextUsage: &ContextUsage{
+			InputTokens:              1,
+			OutputTokens:             168,
+			CacheCreationInputTokens: 971,
+			CachedInputTokens:        40800,
+			ContextWindow:            200_000,
+			UsedTokens:               1 + 971 + 40800,
+		},
+	}
+	e := newClaudeFooterEngine()
+	// stubAgent has Name() == "stub", not "claudecode" — claude-style footer
+	// must not engage even though usage data is fully populated.
+	if got := e.buildClaudeStatusLineFooter(&stubAgent{}, session, "/tmp/ws"); got != "" {
+		t.Errorf("expected empty footer for non-claudecode agent, got %q", got)
+	}
+}
+
+func TestBuildClaudeStatusLineFooter_ClaudecodeNoCacheTokens(t *testing.T) {
+	// claudecode session with no cache hits yet (e.g. very first sub-call
+	// of a fresh API context) still gets the CCD-style footer, just with
+	// the cw/cr segments dropped to avoid rendering "cw 0 cr 0" noise.
 	session := &controllableAgentSession{
 		model:   "claude-opus-4-7[1m]",
 		workDir: "/tmp/ws",
@@ -59,8 +92,21 @@ func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
 		},
 	}
 	e := newClaudeFooterEngine()
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
-		t.Errorf("expected empty footer when cache tokens absent, got %q", got)
+	got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws")
+	if got == "" {
+		t.Fatalf("expected CCD footer for claudecode even without cache tokens, got empty")
+	}
+	if !strings.Contains(got, "out 200") {
+		t.Errorf("missing out segment: %q", got)
+	}
+	if !strings.Contains(got, "in 1.0k") {
+		t.Errorf("missing in segment: %q", got)
+	}
+	if strings.Contains(got, "cw ") || strings.Contains(got, "cr ") {
+		t.Errorf("cw/cr must be dropped when cache tokens are 0, got %q", got)
+	}
+	if !strings.Contains(got, "ctx ") {
+		t.Errorf("missing ctx segment: %q", got)
 	}
 }
 
@@ -78,7 +124,7 @@ func TestBuildClaudeStatusLineFooter_FullRender(t *testing.T) {
 		},
 	}
 	e := newClaudeFooterEngine()
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws")
 	// 41772 / 1_000_000 = 4.17% → rounds to 4%.
 	// Output is two lines:
 	//   line 1: <model id> · out N · in N cw N cr N · ctx N%
@@ -100,8 +146,8 @@ func TestBuildClaudeStatusLineFooter_FullRender(t *testing.T) {
 	if parts[2] != "in 1 cw 971 cr 40.8k" {
 		t.Errorf("in/cw/cr segment = %q, want %q", parts[2], "in 1 cw 971 cr 40.8k")
 	}
-	if parts[3] != "ctx 4%" {
-		t.Errorf("ctx segment = %q, want %q", parts[3], "ctx 4%")
+	if parts[3] != "ctx ~96% left" {
+		t.Errorf("ctx segment = %q, want %q", parts[3], "ctx ~96% left")
 	}
 	if lines[1] == "" || !strings.Contains(lines[1], "ws") {
 		t.Errorf("line 2 = %q, want workspace path containing 'ws'", lines[1])
@@ -125,7 +171,7 @@ func TestBuildClaudeStatusLineFooter_FooterDisabled(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetReplyFooterEnabled(false)
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws"); got != "" {
 		t.Errorf("reply_footer=false must suppress footer, got %q", got)
 	}
 }
@@ -147,7 +193,7 @@ func TestBuildClaudeStatusLineFooter_HideContextLine(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetShowContextIndicator(false)
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws")
 	if strings.Contains(got, "\n") {
 		t.Errorf("line 1 should be hidden — got multi-line footer: %q", got)
 	}
@@ -176,7 +222,7 @@ func TestBuildClaudeStatusLineFooter_HideWorkdirLine(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetShowWorkdirIndicator(false)
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws")
 	if strings.Contains(got, "\n") {
 		t.Errorf("line 2 should be hidden — got multi-line footer: %q", got)
 	}
@@ -206,7 +252,7 @@ func TestBuildClaudeStatusLineFooter_HideBothLines(t *testing.T) {
 	e := newClaudeFooterEngine()
 	e.SetShowContextIndicator(false)
 	e.SetShowWorkdirIndicator(false)
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(&stubClaudecodeAgent{}, session, "/tmp/ws"); got != "" {
 		t.Errorf("both lines hidden should yield empty footer, got %q", got)
 	}
 }

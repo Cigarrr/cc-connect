@@ -435,6 +435,20 @@ type ContextUsageReporter interface {
 	GetContextUsage() *ContextUsage
 }
 
+// CCDStatusFooterCapable is an optional Agent capability marker. Agents whose
+// session emits CCD-statusline-compatible token usage (the stable
+// out / in / cw / cr / ctx fields suitable for the multi-line reply footer
+// rendered with text_size:"notation" by Lark/Feishu) implement it and return
+// true. The engine emits the CCD-style multi-line footer only when this
+// capability reports true; other agents fall through to the default
+// (legacy single-line) reply footer.
+//
+// Implementing this is an explicit opt-in, used in lieu of hardcoding the
+// agent registry name in core (see CLAUDE.md §1).
+type CCDStatusFooterCapable interface {
+	UsesCCDStatusFooter() bool
+}
+
 // ContextUsage describes runtime context consumption for the active session.
 type ContextUsage struct {
 	// UsedTokens is the current token load to compare against ContextWindow when
